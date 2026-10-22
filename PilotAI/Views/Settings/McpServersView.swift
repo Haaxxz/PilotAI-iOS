@@ -26,7 +26,7 @@ public struct McpServersView: View {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(server.name).font(.headline).foregroundColor(.primary)
                                     Text("\(server.transportType.displayName) · \(server.urlOrCommand)")
-                                        .font(.caption).fontDesign(.monospaced)
+                                        .font(.caption.monospaced())
                                         .foregroundColor(.secondary).lineLimit(1)
                                     Text("\(server.activeTools.count) of \(server.tools.count) tools enabled")
                                         .font(.caption).foregroundColor(.secondary)
@@ -177,7 +177,7 @@ struct McpServerEditorSheet: View {
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(tool.title.isEmpty ? tool.name : tool.title).font(.headline)
                                         if !tool.title.isEmpty {
-                                            Text(tool.name).font(.caption).fontDesign(.monospaced).foregroundColor(.secondary)
+                                            Text(tool.name).font(.caption.monospaced()).foregroundColor(.secondary)
                                         }
                                     }
                                 }
@@ -187,7 +187,7 @@ struct McpServerEditorSheet: View {
                                 Text(annotationSummary(tool)).font(.caption).foregroundColor(.secondary)
                                 DisclosureGroup("Input Schema") {
                                     Text(tool.inputSchemaJson)
-                                        .font(.caption2).fontDesign(.monospaced).textSelection(.enabled)
+                                        .font(.caption2.monospaced()).textSelection(.enabled)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                                 .font(.caption)
