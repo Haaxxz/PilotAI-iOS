@@ -42,28 +42,9 @@ public struct BackupRestoreView: View {
                 let fileURL = try result.get()
                 if fileURL.startAccessingSecurityScopedResource() {
                     defer { fileURL.stopAccessingSecurityScopedResource() }
-                    let data = try Data(contentsOf: fileURL)
-                    let payload = try BackupService.shared.importBackup(data: data)
-                    
-                    if let convs = payload.conversations {
-                        state.conversations = convs
-                    }
-                    if let provs = payload.providers {
-                        state.providers = provs
-                    }
-                    if let mem = payload.memoryMd {
-                        state.memory.markdown = mem
-                    }
-                    if let chars = payload.characters {
-                        state.characters = chars
-                    }
-                    
-                    state.saveMemory(state.memory)
-                    state.saveProviders()
-                    state.saveCharacters()
-                    StorageService.shared.saveConversations(state.conversations)
-                    
-                    alertMessage = "Backup imported successfully!"
+                    let payload = try BackupService.shared.importBackup(from: fileURL)
+                    let result = state.applyBackup(payload)
+                    alertMessage = "Backup imported successfully (+\(result.conversationsAdded) conversations, +\(result.providersAdded) providers)."
                     showAlert = true
                 }
             } catch {
@@ -86,7 +67,9 @@ public struct BackupRestoreView: View {
                 memory: state.memory,
                 characters: state.characters,
                 selectedProviderId: state.settings.defaultProviderId,
-                selectedModelId: state.settings.defaultModelId
+                selectedModelId: state.settings.defaultModelId,
+                skills: state.skills, preserving: state.backupPreservation,
+                mcpServers: state.mcpServers, settings: state.settings
             )
             self.shareData = data
             self.showShareSheet = true
@@ -129,6 +112,13 @@ public struct SettingsView: View {
                 }
                 
                 Section(header: Text("Agent Capabilities")) {
+                    NavigationLink(destination: MemoryView().environmentObject(state)) {
+                        HStack {
+                            Image(systemName: "brain.head.profile")
+                                .foregroundColor(.pink)
+                            Text("Core Memory")
+                        }
+                    }
                     NavigationLink(destination: McpServersView().environmentObject(state)) {
                         HStack {
                             Image(systemName: "server.rack")
@@ -158,25 +148,28 @@ public struct SettingsView: View {
                             Text(theme.displayName).tag(theme)
                         }
                     }
-                    .onChange(of: state.settings.theme) {
+                    .onChange(of: state.settings.theme) { _ in
                         state.saveSettings()
                     }
                 }
                 
                 Section(header: Text("Preferences")) {
                     Toggle("Haptic Feedback", isOn: $state.settings.hapticsEnabled)
-                        .onChange(of: state.settings.hapticsEnabled) { state.saveSettings() }
+                        .onChange(of: state.settings.hapticsEnabled) { _ in state.saveSettings() }
                     
                     Toggle("Auto-scroll Messages", isOn: $state.settings.autoScroll)
-                        .onChange(of: state.settings.autoScroll) { state.saveSettings() }
+                        .onChange(of: state.settings.autoScroll) { _ in state.saveSettings() }
                     
                     Toggle("Smooth Stream Reveal", isOn: $state.settings.smoothStreamReveal)
-                        .onChange(of: state.settings.smoothStreamReveal) { state.saveSettings() }
+                        .onChange(of: state.settings.smoothStreamReveal) { _ in state.saveSettings() }
+
+                    Toggle("Send on Return", isOn: $state.settings.sendOnEnter)
+                        .onChange(of: state.settings.sendOnEnter) { _ in state.saveSettings() }
                 }
                 
                 Section(header: Text("Unsandboxed Command Gateway"), footer: Text("Routes terminal commands to a local desktop machine or remote server without iOS app sandbox limits.")) {
                     Toggle("Enable Remote Gateway", isOn: $state.settings.enableUnsandboxedGateway)
-                        .onChange(of: state.settings.enableUnsandboxedGateway) { state.saveSettings() }
+                        .onChange(of: state.settings.enableUnsandboxedGateway) { _ in state.saveSettings() }
                     
                     if state.settings.enableUnsandboxedGateway {
                         HStack {
@@ -186,7 +179,7 @@ public struct SettingsView: View {
                                 .autocorrectionDisabled()
                                 .textInputAutocapitalization(.never)
                                 .keyboardType(.URL)
-                                .onChange(of: state.settings.remoteGatewayURL) { state.saveSettings() }
+                                .onChange(of: state.settings.remoteGatewayURL) { _ in state.saveSettings() }
                         }
                     }
                 }
@@ -197,6 +190,13 @@ public struct SettingsView: View {
                             Image(systemName: "arrow.triangle.2.circlepath")
                                 .foregroundColor(.orange)
                             Text("Backup & Restore")
+                        }
+                    }
+                    NavigationLink(destination: WorkspaceView()) {
+                        HStack {
+                            Image(systemName: "folder.badge.gearshape")
+                                .foregroundColor(.blue)
+                            Text("Private Workspace")
                         }
                     }
                 }

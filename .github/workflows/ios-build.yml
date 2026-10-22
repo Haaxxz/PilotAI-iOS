@@ -1,4 +1,4 @@
-name: Build PilotAI iOS IPA
+name: Build SwiftUI PilotAI iOS IPA
 
 on:
   push:
@@ -32,7 +32,20 @@ jobs:
       - name: List Available Schemes
         run: xcodebuild -project PilotAI.xcodeproj -list
 
-      - name: Archive Project
+      - name: Run Swift unit tests
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project PilotAI.xcodeproj \
+            -scheme PilotAI \
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            -only-testing:PilotAITests \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SWIFT_VERSION=5.0
+
+      - name: Archive native SwiftUI app
         run: |
           set -o pipefail
           xcodebuild archive \
@@ -71,12 +84,13 @@ jobs:
           echo "=== All files in .app ==="
           find build/PilotAI.xcarchive/Products/Applications/PilotAI.app -type f | sort
 
-      - name: Package IPA
+      - name: Package unsigned IPA from native SwiftUI archive
         run: |
+          rm -rf build/Payload build/PilotAI-unsigned.ipa
           mkdir -p build/Payload
           cp -R build/PilotAI.xcarchive/Products/Applications/PilotAI.app build/Payload/
           cd build
-          zip -qr9 PilotAI-unsigned.ipa Payload
+          zip -X -r9 PilotAI-unsigned.ipa Payload
           echo "=== IPA size ==="
           du -sh PilotAI-unsigned.ipa
           echo "=== IPA contents ==="

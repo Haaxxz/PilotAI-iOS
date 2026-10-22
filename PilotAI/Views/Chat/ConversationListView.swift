@@ -6,6 +6,8 @@ public struct ConversationListView: View {
     @State private var searchQuery = ""
     @State private var shareData: URL? = nil
     @State private var showShareSheet: Bool = false
+    @State private var conversationToRename: Conversation?
+    @State private var renameText: String = ""
     
     public init() {}
     
@@ -71,16 +73,32 @@ public struct ConversationListView: View {
                         }
                         .contextMenu {
                             Button {
+                                state.duplicateConversation(id: conv.id)
+                            } label: {
+                                Label("Duplicate", systemImage: "plus.square.on.square")
+                            }
+                            Button {
+                                renameText = conv.title
+                                conversationToRename = conv
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+                            Button {
                                 exportConversation(conv)
                             } label: {
                                 Label("Export Markdown", systemImage: "square.and.arrow.up")
+                            }
+                            Button(role: .destructive) {
+                                state.deleteConversation(id: conv.id)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
                             }
                         }
                     }
                     .onDelete { indexSet in
                         for index in indexSet {
-                            let item = state.conversations[index]
-                            state.deleteConversation(id: item.id)
+                            guard filteredConversations.indices.contains(index) else { continue }
+                            state.deleteConversation(id: filteredConversations[index].id)
                         }
                     }
                 }
@@ -108,6 +126,23 @@ public struct ConversationListView: View {
                 if let url = shareData {
                     ShareSheet(items: [url])
                 }
+            }
+            .alert("Rename Conversation", isPresented: Binding(
+                get: { conversationToRename != nil },
+                set: { if !$0 { conversationToRename = nil } }
+            )) {
+                TextField("Conversation title", text: $renameText)
+                Button("Cancel", role: .cancel) { conversationToRename = nil }
+                Button("Save") {
+                    guard let conversation = conversationToRename else { return }
+                    let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !title.isEmpty {
+                        state.renameConversation(id: conversation.id, title: title)
+                    }
+                    conversationToRename = nil
+                }
+            } message: {
+                Text("Choose a title for this conversation.")
             }
         }
     }

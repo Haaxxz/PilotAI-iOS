@@ -1,243 +1,203 @@
 import Foundation
-
-public struct StreamChunk {
-    public let textDelta: String?
-    public let reasoningDelta: String?
-    public let toolCallDelta: ToolCall?
-    public let isFinished: Bool
-    
-    public init(textDelta: String? = nil, reasoningDelta: String? = nil, toolCallDelta: ToolCall? = nil, isFinished: Bool = false) {
-        self.textDelta = textDelta
-        self.reasoningDelta = reasoningDelta
-        self.toolCallDelta = toolCallDelta
-        self.isFinished = isFinished
-    }
-}
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public final class OpenAIService {
     public static let shared = OpenAIService()
-    
+    private let configuration: URLSessionConfiguration
+
+    /// Configuration injection also permits deterministic URLProtocol transport tests.
+    public init(configuration: URLSessionConfiguration = .ephemeral) {
+        self.configuration = configuration.copy() as! URLSessionConfiguration
+        self.configuration.httpCookieStorage = nil
+        self.configuration.httpShouldSetCookies = false
+        self.configuration.urlCredentialStorage = nil
+        self.configuration.urlCache = nil
+        self.configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        self.configuration.timeoutIntervalForRequest = 120
+        self.configuration.timeoutIntervalForResource = 600
+    }
+
+    /// Existing callers remain source compatible. An explicit search switch can restrict the provider default per run.
     public func streamChat(
         provider: ModelProvider,
         modelId: String,
         messages: [Message],
         systemPrompt: String? = nil,
-        tools: [[String: Any]]? = nil
+        tools: [[String: Any]]? = nil,
+        hostedWebSearchEnabled: Bool? = nil
     ) -> AsyncThrowingStream<StreamChunk, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    if provider.type == .anthropic {
-                        try await self.streamAnthropic(
-                            provider: provider,
-                            modelId: modelId,
-                            messages: messages,
-                            systemPrompt: systemPrompt,
-                            continuation: continuation
-                        )
-                    } else {
-                        try await self.streamOpenAI(
-                            provider: provider,
-                            modelId: modelId,
-                            messages: messages,
-                            systemPrompt: systemPrompt,
-                            tools: tools,
-                            continuation: continuation
-                        )
+                    try Task.checkCancellation()
+                    let request = try ProviderRequestBuilder.request(provider: provider, modelId: modelId, messages: messages,
+                                                                     systemPrompt: systemPrompt, tools: tools,
+                                                                     hostedWebSearchEnabled: hostedWebSearchEnabled)
+                    let transport = ProviderHTTPStream(configuration: self.configuration)
+                    defer { transport.cancel() }
+                    var parser = ProviderStreamParser(api: ProviderRequestBuilder.api(for: provider))
+                    for try await data in transport.start(request: request, streaming: true) {
+                        try Task.checkCancellation()
+                        for chunk in try parser.append(data) { continuation.yield(chunk) }
+                        if parser.isFinished { break }
+                    }
+                    try Task.checkCancellation()
+                    try parser.finish()
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: ProviderServiceError.sanitized(error))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Authenticated discovery always uses the supplied draft, including Anthropic's headers and pagination.
+    public func fetchModels(provider: ModelProvider) async throws -> [ModelDefinition] {
+        do {
+            var models: [ModelDefinition] = []
+            var seen = Set<String>()
+            var cursors = Set<String>()
+            var cursor: String?
+            for _ in 0..<100 {
+                try Task.checkCancellation()
+                let request = try ProviderRequestBuilder.modelsRequest(provider: provider, afterID: cursor)
+                let transport = ProviderHTTPStream(configuration: configuration)
+                var data = Data()
+                do {
+                    for try await bytes in transport.start(request: request, streaming: false) {
+                        try Task.checkCancellation()
+                        guard data.count + bytes.count <= 4 * 1024 * 1024 else { throw ProviderServiceError.streamLimit }
+                        data.append(bytes)
                     }
                 } catch {
-                    continuation.finish(throwing: error)
+                    transport.cancel()
+                    throw error
                 }
+                transport.cancel()
+                try Task.checkCancellation()
+                let page = try ProviderRequestBuilder.parseModels(data, anthropic: provider.type == .anthropic)
+                models.append(contentsOf: page.models.filter { seen.insert($0.id).inserted })
+                guard let next = page.nextID else { return models }
+                guard cursors.insert(next).inserted else { throw ProviderServiceError.invalidResponse }
+                cursor = next
             }
-            
-            continuation.onTermination = { _ in
-                task.cancel()
-            }
+            throw ProviderServiceError.streamLimit
+        } catch { throw ProviderServiceError.sanitized(error) }
+    }
+
+    /// A real inference request verifies a model, rather than mistaking /models for generation access.
+    public func testModel(provider: ModelProvider, modelId: String) async throws {
+        var testProvider = provider
+        testProvider.hostedWebSearchEnabled = false
+        var completed = false
+        for try await chunk in streamChat(provider: testProvider, modelId: modelId,
+                                          messages: [Message(role: .user, content: "Reply with OK.")],
+                                          systemPrompt: "", tools: [], hostedWebSearchEnabled: false) {
+            if chunk.toolCallDelta != nil { throw ProviderServiceError.invalidToolCall }
+            if chunk.isFinished { completed = true }
+        }
+        try Task.checkCancellation()
+        guard completed else { throw ProviderServiceError.incompleteStream }
+    }
+}
+
+/// A small delegate transport avoids AsyncBytes.lines dropping SSE framing information.
+/// All redirects are rejected so neither built-in nor arbitrary custom auth headers can leak to a new origin.
+private final class ProviderHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let configuration: URLSessionConfiguration
+    private let lock = NSLock()
+    private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+    private var receivedResponse = false
+    private var streaming = false
+
+    init(configuration: URLSessionConfiguration) {
+        self.configuration = configuration
+    }
+
+    func start(request: URLRequest, streaming: Bool) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(256)) { continuation in
+            self.lock.lock()
+            self.streaming = streaming
+            self.continuation = continuation
+            let session = URLSession(configuration: self.configuration, delegate: self, delegateQueue: nil)
+            self.session = session
+            let task = session.dataTask(with: request)
+            self.task = task
+            self.lock.unlock()
+            continuation.onTermination = { [weak self] _ in self?.cancel() }
+            task.resume()
         }
     }
-    
-    private func streamOpenAI(
-        provider: ModelProvider,
-        modelId: String,
-        messages: [Message],
-        systemPrompt: String?,
-        tools: [[String: Any]]?,
-        continuation: AsyncThrowingStream<StreamChunk, Error>.Continuation
-    ) async throws {
-        var endpoint = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !endpoint.hasSuffix("/chat/completions") && !endpoint.hasSuffix("/responses") {
-            if endpoint.hasSuffix("/") {
-                endpoint += "chat/completions"
-            } else {
-                endpoint += "/chat/completions"
-            }
-        }
-        
-        guard let url = URL(string: endpoint) else { throw URLError(.badURL) }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        if !provider.apiKey.isEmpty {
-            request.setValue("Bearer \(provider.apiKey)", forHTTPHeaderField: "Authorization")
-        }
-        
-        for header in provider.customHeaders {
-            request.setValue(header.value, forHTTPHeaderField: header.key)
-        }
-        
-        var apiMessages: [[String: Any]] = []
-        if let sys = systemPrompt, !sys.isEmpty {
-            apiMessages.append(["role": "system", "content": sys])
-        }
-        
-        for msg in messages {
-            var m: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
-            if let tools = msg.toolCalls, !tools.isEmpty {
-                m["tool_calls"] = tools.map { t in
-                    [
-                        "id": t.id,
-                        "type": "function",
-                        "function": [
-                            "name": t.name,
-                            "arguments": t.arguments
-                        ]
-                    ]
-                }
-            }
-            apiMessages.append(m)
-        }
-        
-        var body: [String: Any] = [
-            "model": modelId,
-            "messages": apiMessages,
-            "stream": true
-        ]
-        
-        if let tools = tools, !tools.isEmpty {
-            body["tools"] = tools
-        }
-        
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        
-        guard (200...299).contains(httpResponse.statusCode) else {
-            var errText = ""
-            for try await line in asyncBytes.lines { errText += line }
-            throw NSError(domain: "OpenAIService", code: httpResponse.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "HTTP \(httpResponse.statusCode): \(errText)"
-            ])
-        }
-        
-        for try await line in asyncBytes.lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || trimmed.hasPrefix(":") { continue }
-            if trimmed == "data: [DONE]" {
-                continuation.yield(StreamChunk(isFinished: true))
-                break
-            }
-            guard trimmed.hasPrefix("data: ") else { continue }
-            let jsonStr = String(trimmed.dropFirst(6))
-            guard let jsonData = jsonStr.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                  let choices = json["choices"] as? [[String: Any]],
-                  let first = choices.first else { continue }
-            
-            let delta = first["delta"] as? [String: Any]
-            let text = delta?["content"] as? String
-            let reasoning = delta?["reasoning_content"] as? String ?? delta?["reasoning"] as? String
-            
-            continuation.yield(StreamChunk(textDelta: text, reasoningDelta: reasoning))
-        }
-        continuation.finish()
+
+    func cancel() {
+        lock.lock()
+        let session = self.session
+        let task = self.task
+        self.session = nil
+        self.task = nil
+        self.continuation = nil
+        lock.unlock()
+        task?.cancel()
+        session?.invalidateAndCancel()
     }
-    
-    private func streamAnthropic(
-        provider: ModelProvider,
-        modelId: String,
-        messages: [Message],
-        systemPrompt: String?,
-        continuation: AsyncThrowingStream<StreamChunk, Error>.Continuation
-    ) async throws {
-        var endpoint = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !endpoint.hasSuffix("/v1/messages") && !endpoint.hasSuffix("/messages") {
-            if endpoint.hasSuffix("/") {
-                endpoint += "v1/messages"
-            } else {
-                endpoint += "/v1/messages"
-            }
+
+    private func finish(_ error: Error? = nil) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        if let error { continuation?.finish(throwing: ProviderServiceError.sanitized(error)) }
+        else { continuation?.finish() }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let response = response as? HTTPURLResponse else {
+            finish(ProviderServiceError.invalidResponse)
+            completionHandler(.cancel)
+            return
         }
-        
-        guard let url = URL(string: endpoint) else { throw URLError(.badURL) }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(provider.apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue(provider.anthropicVersion.isEmpty ? "2023-06-01" : provider.anthropicVersion, forHTTPHeaderField: "anthropic-version")
-        
-        for header in provider.customHeaders {
-            request.setValue(header.value, forHTTPHeaderField: header.key)
+        guard (200...299).contains(response.statusCode) else {
+            finish(ProviderServiceError.http(response.statusCode))
+            completionHandler(.cancel)
+            return
         }
-        
-        var apiMessages: [[String: Any]] = []
-        for msg in messages {
-            let role = msg.role == .user ? "user" : "assistant"
-            apiMessages.append(["role": role, "content": msg.content])
+        lock.lock()
+        let requiresSSE = streaming
+        lock.unlock()
+        if requiresSSE && response.mimeType?.lowercased() != "text/event-stream" {
+            finish(ProviderServiceError.invalidResponse)
+            completionHandler(.cancel)
+            return
         }
-        
-        var body: [String: Any] = [
-            "model": modelId,
-            "messages": apiMessages,
-            "max_tokens": 4096,
-            "stream": true
-        ]
-        
-        if let sys = systemPrompt, !sys.isEmpty {
-            body["system"] = sys
-        }
-        
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        
-        guard (200...299).contains(httpResponse.statusCode) else {
-            var errText = ""
-            for try await line in asyncBytes.lines { errText += line }
-            throw NSError(domain: "OpenAIService", code: httpResponse.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "HTTP \(httpResponse.statusCode): \(errText)"
-            ])
-        }
-        
-        for try await line in asyncBytes.lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || trimmed.hasPrefix(":") { continue }
-            if trimmed.hasPrefix("data: ") {
-                let jsonStr = String(trimmed.dropFirst(6))
-                guard let jsonData = jsonStr.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
-                
-                let type = json["type"] as? String ?? ""
-                if type == "message_stop" {
-                    continuation.yield(StreamChunk(isFinished: true))
-                    break
-                }
-                
-                if type == "content_block_delta",
-                   let delta = json["delta"] as? [String: Any] {
-                    let deltaType = delta["type"] as? String ?? ""
-                    if deltaType == "text_delta", let text = delta["text"] as? String {
-                        continuation.yield(StreamChunk(textDelta: text))
-                    } else if deltaType == "thinking_delta", let thinking = delta["thinking"] as? String {
-                        continuation.yield(StreamChunk(reasoningDelta: thinking))
-                    }
-                }
-            }
-        }
-        continuation.finish()
+        lock.lock()
+        receivedResponse = true
+        lock.unlock()
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        let continuation = self.continuation
+        lock.unlock()
+        if case .dropped = continuation?.yield(data) { finish(ProviderServiceError.streamLimit) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let received = receivedResponse
+        lock.unlock()
+        finish(error ?? (received ? nil : ProviderServiceError.invalidResponse))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        finish(ProviderServiceError.http(response.statusCode))
+        completionHandler(nil)
     }
 }

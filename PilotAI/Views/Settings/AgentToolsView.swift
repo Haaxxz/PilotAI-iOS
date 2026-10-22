@@ -20,12 +20,24 @@ public struct AgentToolsView: View {
                 Toggle(isOn: $state.settings.enableFileAccessTool) {
                     Label("File Read / Write Tool", systemImage: "doc.text.fill")
                 }
+                Toggle(isOn: $state.settings.enableBrowserTool) {
+                    Label("Shared Browser Tool", systemImage: "safari")
+                }
+                Toggle(isOn: $state.settings.enableWorkspaceTool) {
+                    Label("Private Workspace Tool", systemImage: "folder.badge.gearshape")
+                }
+                Toggle(isOn: $state.settings.enableMCPTool) {
+                    Label("MCP Server Tools", systemImage: "server.rack")
+                }
             }
         }
-        .onChange(of: state.settings.enableWebSearchTool) { state.saveSettings() }
-        .onChange(of: state.settings.enableTerminalTool) { state.saveSettings() }
-        .onChange(of: state.settings.enableMemoryTool) { state.saveSettings() }
-        .onChange(of: state.settings.enableFileAccessTool) { state.saveSettings() }
+        .onChange(of: state.settings.enableWebSearchTool) { _ in state.saveSettings() }
+        .onChange(of: state.settings.enableTerminalTool) { _ in state.saveSettings() }
+        .onChange(of: state.settings.enableMemoryTool) { _ in state.saveSettings() }
+        .onChange(of: state.settings.enableFileAccessTool) { _ in state.saveSettings() }
+        .onChange(of: state.settings.enableBrowserTool) { _ in state.saveSettings() }
+        .onChange(of: state.settings.enableWorkspaceTool) { _ in state.saveSettings() }
+        .onChange(of: state.settings.enableMCPTool) { _ in state.saveSettings() }
         .navigationTitle("Agent Tools")
         .navigationBarTitleDisplayMode(.inline)
     }

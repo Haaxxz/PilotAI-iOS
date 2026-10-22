@@ -67,6 +67,22 @@ public struct ModelDefinition: Identifiable, Codable, Equatable {
         self.contextWindowOverride = contextWindowOverride
         self.sortOrder = sortOrder
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, supportsVision, supportsReasoning, contextWindow, contextWindowOverride, sortOrder
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try values.decode(String.self, forKey: .id)
+        self.init(id: id,
+                  name: try values.decodeIfPresent(String.self, forKey: .name) ?? id,
+                  supportsVision: try values.decodeIfPresent(Bool.self, forKey: .supportsVision) ?? false,
+                  supportsReasoning: try values.decodeIfPresent(Bool.self, forKey: .supportsReasoning) ?? false,
+                  contextWindow: try values.decodeIfPresent(Int.self, forKey: .contextWindow) ?? 128_000,
+                  contextWindowOverride: try values.decodeIfPresent(Int.self, forKey: .contextWindowOverride),
+                  sortOrder: try values.decodeIfPresent(Int.self, forKey: .sortOrder) ?? 0)
+    }
 }
 
 public struct CustomHeader: Identifiable, Codable, Equatable {
@@ -78,6 +94,15 @@ public struct CustomHeader: Identifiable, Codable, Equatable {
         self.id = id
         self.key = key
         self.value = value
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, key, value }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(id: try values.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString,
+                  key: try values.decode(String.self, forKey: .key),
+                  value: try values.decode(String.self, forKey: .value))
     }
 }
 
@@ -96,6 +121,11 @@ public struct ModelProvider: Identifiable, Codable, Equatable {
     public var endpointMode: String
     public var hostedWebSearchEnabled: Bool
     public var anthropicVersion: String
+    /// Additional JSON parameters; protocol-owned fields cannot be overridden.
+    public var customRequestBodyJSON: String
+    /// Empty means use the model's default. OpenAI-compatible APIs only.
+    public var reasoningEffort: String
+    public var maxOutputTokens: Int?
     
     public init(
         id: String = UUID().uuidString,
@@ -111,7 +141,10 @@ public struct ModelProvider: Identifiable, Codable, Equatable {
         systemPrompt: String = "",
         endpointMode: String = "chat_completions",
         hostedWebSearchEnabled: Bool = false,
-        anthropicVersion: String = "2023-06-01"
+        anthropicVersion: String = "2023-06-01",
+        customRequestBodyJSON: String = "",
+        reasoningEffort: String = "",
+        maxOutputTokens: Int? = nil
     ) {
         self.id = id
         self.name = name
@@ -127,6 +160,40 @@ public struct ModelProvider: Identifiable, Codable, Equatable {
         self.endpointMode = endpointMode
         self.hostedWebSearchEnabled = hostedWebSearchEnabled
         self.anthropicVersion = anthropicVersion
+        self.customRequestBodyJSON = customRequestBodyJSON
+        self.reasoningEffort = reasoningEffort
+        self.maxOutputTokens = maxOutputTokens
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, type, baseURL, apiKey, defaultModelId, models, customHeaders
+        case isEnabled, isBuiltIn, systemPrompt, endpointMode, hostedWebSearchEnabled, anthropicVersion
+        case customRequestBodyJSON, reasoningEffort, maxOutputTokens
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try values.decodeIfPresent(ProviderType.self, forKey: .type) ?? .custom
+        let models = try values.decodeIfPresent([ModelDefinition].self, forKey: .models) ?? []
+        self.init(
+            id: try values.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString,
+            name: try values.decodeIfPresent(String.self, forKey: .name) ?? type.displayName,
+            type: type,
+            baseURL: try values.decodeIfPresent(String.self, forKey: .baseURL),
+            apiKey: try values.decodeIfPresent(String.self, forKey: .apiKey) ?? "",
+            defaultModelId: try values.decodeIfPresent(String.self, forKey: .defaultModelId) ?? models.first?.id ?? "",
+            models: models,
+            customHeaders: try values.decodeIfPresent([CustomHeader].self, forKey: .customHeaders) ?? [],
+            isEnabled: try values.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true,
+            isBuiltIn: try values.decodeIfPresent(Bool.self, forKey: .isBuiltIn) ?? false,
+            systemPrompt: try values.decodeIfPresent(String.self, forKey: .systemPrompt) ?? "",
+            endpointMode: try values.decodeIfPresent(String.self, forKey: .endpointMode) ?? "chat_completions",
+            hostedWebSearchEnabled: try values.decodeIfPresent(Bool.self, forKey: .hostedWebSearchEnabled) ?? false,
+            anthropicVersion: try values.decodeIfPresent(String.self, forKey: .anthropicVersion) ?? "2023-06-01",
+            customRequestBodyJSON: try values.decodeIfPresent(String.self, forKey: .customRequestBodyJSON) ?? "",
+            reasoningEffort: try values.decodeIfPresent(String.self, forKey: .reasoningEffort) ?? "",
+            maxOutputTokens: try values.decodeIfPresent(Int.self, forKey: .maxOutputTokens)
+        )
     }
     
     public static var defaults: [ModelProvider] {
@@ -257,7 +324,7 @@ public struct ModelProvider: Identifiable, Codable, Equatable {
                 name: "OpenRouter",
                 type: .openrouter,
                 baseURL: "https://openrouter.ai/api/v1",
-                apiKey: decodeKey("c2stb3ItdjEtNGVlYjA0NGY3MjUzN2U1MTMzNGJlMzkyZTljMDI1OTE3NTljYTU3NTI4M2I3Mjk5ZThiOTBjZDYyOTY1OTkxZA=="),
+                apiKey: "",
                 defaultModelId: "anthropic/claude-3.5-sonnet",
                 models: [
                     ModelDefinition(id: "deepseek/deepseek-r1", name: "DeepSeek R1", supportsVision: false, supportsReasoning: true, contextWindow: 64_000),
@@ -270,8 +337,4 @@ public struct ModelProvider: Identifiable, Codable, Equatable {
         ]
     }
     
-    private static func decodeKey(_ b64: String) -> String {
-        guard let d = Data(base64Encoded: b64), let s = String(data: d, encoding: .utf8) else { return "" }
-        return s
-    }
 }

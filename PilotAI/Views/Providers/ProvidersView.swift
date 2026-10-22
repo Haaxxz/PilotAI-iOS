@@ -171,6 +171,9 @@ public struct ProviderDetailView: View {
 
     @State private var selectedTab: Int = 0
     @State private var draft: ModelProvider
+    @State private var hasLoadedDraft = false
+    @State private var saveMessage: String?
+    @State private var saveFailed = false
     private let isNew: Bool
 
     public init(providerId: String? = nil, newType: ProvidersView.NewProviderType? = nil) {
@@ -194,25 +197,21 @@ public struct ProviderDetailView: View {
     public var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                if !isNew {
-                    Picker("", selection: $selectedTab) {
-                        Text("Configuration").tag(0)
-                        Text("Models").tag(1)
-                    }
-                    .pickerStyle(.segmented)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
+                Picker("", selection: $selectedTab) {
+                    Text("Configuration").tag(0)
+                    Text("Models").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                if let saveMessage {
+                    Text(saveMessage).font(.caption)
+                        .foregroundColor(saveFailed ? .red : .green)
+                        .padding(.horizontal)
                 }
 
                 if selectedTab == 0 {
-                    ProviderConfigTab(draft: $draft, isNew: isNew) {
-                        if isNew {
-                            state.addProvider(draft)
-                            dismiss()
-                        } else {
-                            state.updateProvider(draft)
-                        }
-                    } onDelete: {
+                    ProviderConfigTab(draft: $draft, isNew: isNew, onSave: saveDraft) {
                         state.deleteProvider(id: draft.id)
                         dismiss()
                     } onReset: {
@@ -222,7 +221,7 @@ public struct ProviderDetailView: View {
                         }
                     }
                 } else {
-                    ProviderModelsTab(provider: $draft)
+                    ProviderModelsTab(provider: $draft, onSaveProvider: saveDraft)
                 }
             }
             .navigationTitle(isNew ? "New Provider" : draft.name)
@@ -235,17 +234,35 @@ public struct ProviderDetailView: View {
                 }
             }
             .onAppear {
+                guard !hasLoadedDraft else { return }
+                hasLoadedDraft = true
                 if let pid = providerId,
                    let p = state.providers.first(where: { $0.id == pid }) {
                     draft = p
                 }
             }
-            .onChange(of: state.providers) {
-                if let pid = providerId,
-                   let p = state.providers.first(where: { $0.id == pid }) {
-                    draft = p
-                }
+        }
+    }
+
+    private func saveDraft() {
+        do {
+            guard !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ProviderServiceError.invalidConfiguration("Enter a provider name.")
             }
+            if draft.defaultModelId.isEmpty { draft.defaultModelId = draft.models.first?.id ?? "" }
+            draft.defaultModelId = try ProviderRequestBuilder.validateModelID(draft.defaultModelId)
+            _ = try ProviderRequestBuilder.request(provider: draft, modelId: draft.defaultModelId,
+                                                    messages: [Message(role: .user, content: "Configuration validation")])
+            if !draft.models.contains(where: { $0.id == draft.defaultModelId }) {
+                draft.models.append(ModelDefinition(id: draft.defaultModelId, name: draft.defaultModelId))
+            }
+            if isNew { state.addProvider(draft); dismiss() }
+            else { state.updateProvider(draft) }
+            saveFailed = false
+            saveMessage = "Provider and models saved."
+        } catch {
+            saveFailed = true
+            saveMessage = ProviderServiceError.sanitized(error).localizedDescription
         }
     }
 }
@@ -262,6 +279,7 @@ private struct ProviderConfigTab: View {
     @State private var showApiKey = false
     @State private var isTesting = false
     @State private var statusMessage: String? = nil
+    @State private var statusFailed = false
     @State private var showDeleteAlert = false
     @State private var showResetAlert = false
     @State private var newHeaderKey = ""
@@ -273,6 +291,9 @@ private struct ProviderConfigTab: View {
             Section(header: Text("Connection")) {
                 TextField("Name", text: $draft.name)
                 TextField("Base URL", text: $draft.baseURL)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                TextField("Default Model ID", text: $draft.defaultModelId)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                 HStack {
@@ -315,22 +336,50 @@ private struct ProviderConfigTab: View {
                     HStack {
                         Text(h.key).font(.system(size: 13, weight: .semibold))
                         Spacer()
-                        Text(h.value).font(.system(size: 12, design: .monospaced)).foregroundColor(.secondary)
+                        Text("••••••••").font(.system(size: 12, design: .monospaced)).foregroundColor(.secondary)
                     }
                 }
                 .onDelete { idx in draft.customHeaders.remove(atOffsets: idx) }
                 HStack {
                     TextField("Header", text: $newHeaderKey).font(.system(size: 13))
-                    TextField("Value", text: $newHeaderVal).font(.system(size: 13))
+                        .autocorrectionDisabled().textInputAutocapitalization(.never)
+                    SecureField("Value", text: $newHeaderVal).font(.system(size: 13))
                     Button(action: {
-                        guard !newHeaderKey.isEmpty else { return }
-                        draft.customHeaders.append(CustomHeader(key: newHeaderKey, value: newHeaderVal))
-                        newHeaderKey = ""
-                        newHeaderVal = ""
+                        do {
+                            let header = CustomHeader(key: newHeaderKey.trimmingCharacters(in: .whitespacesAndNewlines), value: newHeaderVal)
+                            try ProviderRequestBuilder.validateHeader(header)
+                            guard !draft.customHeaders.contains(where: { $0.key.lowercased() == header.key.lowercased() }) else {
+                                throw ProviderServiceError.invalidConfiguration("That header already exists. Remove it before adding a replacement.")
+                            }
+                            draft.customHeaders.append(header)
+                            newHeaderKey = ""
+                            newHeaderVal = ""
+                        } catch {
+                            statusFailed = true
+                            statusMessage = ProviderServiceError.sanitized(error).localizedDescription
+                        }
                     }) {
                         Image(systemName: "plus.circle.fill").foregroundColor(.blue)
                     }
                 }
+            }
+
+            Section(header: Text("Request Parameters"), footer: Text("Additional JSON is merged into requests. Model, messages, tools, streaming and storage are managed by the app. Reasoning support depends on the selected model.")) {
+                TextField("Maximum output tokens (optional)", value: $draft.maxOutputTokens, formatter: tokenFormatter)
+                    .keyboardType(.numberPad)
+                if draft.type != .anthropic {
+                    Picker("Reasoning effort", selection: $draft.reasoningEffort) {
+                        Text("Model default").tag("")
+                        ForEach(["none", "minimal", "low", "medium", "high", "xhigh", "max"], id: \.self) { effort in
+                            Text(effort.capitalized).tag(effort)
+                        }
+                    }
+                }
+                TextEditor(text: $draft.customRequestBodyJSON)
+                    .frame(minHeight: 90)
+                    .font(.system(size: 12, design: .monospaced))
+                    .autocorrectionDisabled().textInputAutocapitalization(.never)
+                Text("Example: {\"temperature\": 0.7}").font(.caption).foregroundColor(.secondary)
             }
 
             // Preferences
@@ -349,14 +398,14 @@ private struct ProviderConfigTab: View {
                 Button(action: testConnection) {
                     HStack {
                         if isTesting { ProgressView().scaleEffect(0.8) }
-                        Text(isTesting ? "Testing…" : "Test Connection")
+                        Text(isTesting ? "Testing…" : "Test Model with Draft Settings")
                     }
                 }.disabled(isTesting)
 
                 if let msg = statusMessage {
                     Text(msg)
                         .font(.caption)
-                        .foregroundColor(msg.lowercased().contains("success") ? .green : .red)
+                        .foregroundColor(statusFailed ? .red : .green)
                 }
 
                 Button(action: onSave) {
@@ -388,29 +437,27 @@ private struct ProviderConfigTab: View {
         } message: { Text("Reset \"\(draft.name)\" to factory defaults? Your API key will be preserved.") }
     }
 
+    private var tokenFormatter: NumberFormatter {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.allowsFloats = false
+        formatter.minimum = 1
+        return formatter
+    }
+
     private func testConnection() {
         isTesting = true
         statusMessage = "Testing…"
-        Task {
+        statusFailed = false
+        let snapshot = draft
+        Task { @MainActor in
+            defer { isTesting = false }
             do {
-                let urlStr = draft.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/models"
-                guard let url = URL(string: urlStr) else { throw URLError(.badURL) }
-                var req = URLRequest(url: url)
-                if !draft.apiKey.isEmpty {
-                    req.setValue("Bearer \(draft.apiKey)", forHTTPHeaderField: "Authorization")
-                }
-                for h in draft.customHeaders { req.setValue(h.value, forHTTPHeaderField: h.key) }
-                let (_, resp) = try await URLSession.shared.data(for: req)
-                await MainActor.run {
-                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                    statusMessage = code < 300 ? "Success: HTTP \(code)" : "Failed: HTTP \(code)"
-                    isTesting = false
-                }
+                try await OpenAIService.shared.testModel(provider: snapshot, modelId: snapshot.defaultModelId)
+                statusMessage = "Success: model completed a streamed reply using the draft settings."
             } catch {
-                await MainActor.run {
-                    statusMessage = "Failed: \(error.localizedDescription)"
-                    isTesting = false
-                }
+                statusFailed = true
+                statusMessage = ProviderServiceError.sanitized(error).localizedDescription
             }
         }
     }
@@ -418,14 +465,15 @@ private struct ProviderConfigTab: View {
 
 // MARK: - ProviderModelsTab
 private struct ProviderModelsTab: View {
-    @EnvironmentObject private var state: AppState
     @Binding var provider: ModelProvider
+    let onSaveProvider: () -> Void
     @State private var searchQuery = ""
     @State private var isFetching = false
     @State private var fetchMessage: String? = nil
+    @State private var fetchFailed = false
+    @State private var testingModelID: String?
     @State private var editingModel: ModelDefinition? = nil
     @State private var isCreatingModel = false
-    @State private var modelToDelete: ModelDefinition? = nil
 
     var filteredModels: [ModelDefinition] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -447,15 +495,18 @@ private struct ProviderModelsTab: View {
 
                 Button(action: {
                     isCreatingModel = true
-                    editingModel = ModelDefinition(id: UUID().uuidString, name: "Custom Model")
+                    editingModel = ModelDefinition(id: "", name: "")
                 }) {
                     Label("Add Custom Model", systemImage: "plus.circle.fill")
                 }
 
                 if let msg = fetchMessage {
                     Text(msg).font(.caption)
-                        .foregroundColor(msg.lowercased().contains("success") || msg.first?.isNumber == true ? .green : .secondary)
+                        .foregroundColor(fetchFailed ? .red : .green)
                 }
+                Button("Save Provider and Models", action: onSaveProvider)
+                Text("Discovery and tests use the current draft URL, authentication and headers. Save to keep model changes.")
+                    .font(.caption).foregroundColor(.secondary)
             }
 
             Section(header: Text("\(provider.models.count) Model(s)")) {
@@ -470,19 +521,21 @@ private struct ProviderModelsTab: View {
                         .padding(.vertical, 8)
                 } else {
                     ForEach(filteredModels) { model in
-                        ModelRow(model: model, isActive: model.id == state.selectedConversation?.modelId) {
+                        ModelRow(model: model, isActive: model.id == provider.defaultModelId,
+                                 isTesting: testingModelID == model.id, canTest: testingModelID == nil) {
                             editingModel = model
                             isCreatingModel = false
                         } onSelect: {
-                            if var conv = state.selectedConversation {
-                                conv.modelId = model.id
-                                state.selectedConversation = conv
-                            }
+                            provider.defaultModelId = model.id
+                        } onTest: {
+                            testModel(model.id)
                         }
                     }
                     .onDelete { idx in
                         let toDelete = idx.map { filteredModels[$0] }
-                        toDelete.forEach { state.deleteModel(from: provider.id, modelId: $0.id) }
+                        let ids = Set(toDelete.map(\.id))
+                        provider.models.removeAll { ids.contains($0.id) }
+                        if ids.contains(provider.defaultModelId) { provider.defaultModelId = provider.models.first?.id ?? "" }
                     }
                 }
             }
@@ -491,12 +544,14 @@ private struct ProviderModelsTab: View {
             ModelEditSheet(
                 model: model,
                 isNew: isCreatingModel,
+                existingIDs: Set(provider.models.filter { isCreatingModel || $0.id != model.id }.map(\.id)),
                 onSave: { updated in
                     if isCreatingModel {
-                        state.addModel(to: provider.id, model: updated)
-                    } else {
-                        state.updateModel(in: provider.id, model: updated)
+                        provider.models.append(updated)
+                    } else if let index = provider.models.firstIndex(where: { $0.id == model.id }) {
+                        provider.models[index] = updated
                     }
+                    if provider.defaultModelId.isEmpty || provider.defaultModelId == model.id { provider.defaultModelId = updated.id }
                     editingModel = nil
                 },
                 onCancel: { editingModel = nil }
@@ -507,12 +562,36 @@ private struct ProviderModelsTab: View {
     private func fetchModels() {
         isFetching = true
         fetchMessage = nil
-        Task {
-            await state.fetchModels(for: provider.id)
-            await MainActor.run {
-                isFetching = false
-                let count = state.providers.first(where: { $0.id == provider.id })?.models.count ?? 0
-                fetchMessage = "\(count) models synced"
+        fetchFailed = false
+        let snapshot = provider
+        Task { @MainActor in
+            defer { isFetching = false }
+            do {
+                let models = try await OpenAIService.shared.fetchModels(provider: snapshot)
+                let existingIDs = Set(provider.models.map(\.id))
+                provider.models.append(contentsOf: models.filter { !existingIDs.contains($0.id) })
+                if provider.defaultModelId.isEmpty { provider.defaultModelId = provider.models.first?.id ?? "" }
+                fetchMessage = "Discovered \(models.count) model(s). Save to keep the updated list."
+            } catch {
+                fetchFailed = true
+                fetchMessage = ProviderServiceError.sanitized(error).localizedDescription
+            }
+        }
+    }
+
+    private func testModel(_ id: String) {
+        let snapshot = provider
+        testingModelID = id
+        fetchFailed = false
+        fetchMessage = "Testing model…"
+        Task { @MainActor in
+            defer { testingModelID = nil }
+            do {
+                try await OpenAIService.shared.testModel(provider: snapshot, modelId: id)
+                fetchMessage = "Success: the selected model completed a streamed reply."
+            } catch {
+                fetchFailed = true
+                fetchMessage = ProviderServiceError.sanitized(error).localizedDescription
             }
         }
     }
@@ -521,8 +600,11 @@ private struct ProviderModelsTab: View {
 private struct ModelRow: View {
     let model: ModelDefinition
     let isActive: Bool
+    let isTesting: Bool
+    let canTest: Bool
     let onEdit: () -> Void
     let onSelect: () -> Void
+    let onTest: () -> Void
 
     var body: some View {
         HStack {
@@ -537,7 +619,7 @@ private struct ModelRow: View {
                         Label("Reasoning", systemImage: "brain").font(.caption2).foregroundColor(.purple)
                     }
                     if isActive {
-                        Text("Active").font(.caption2)
+                        Text("Default").font(.caption2)
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(Color.blue.opacity(0.1)).foregroundColor(.blue)
                             .cornerRadius(4)
@@ -545,13 +627,20 @@ private struct ModelRow: View {
                 }
             }
             Spacer()
+            Button(action: onTest) {
+                if isTesting { ProgressView() }
+                else { Image(systemName: "play.circle").foregroundColor(.blue) }
+            }.buttonStyle(.plain).disabled(!canTest)
+                .accessibilityLabel("Test model")
             Button(action: onEdit) {
                 Image(systemName: "slider.horizontal.3").foregroundColor(.secondary)
             }.buttonStyle(.plain)
+                .accessibilityLabel("Edit model")
             Button(action: onSelect) {
                 Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
                     .foregroundColor(isActive ? .blue : .secondary)
             }.buttonStyle(.plain)
+                .accessibilityLabel("Set default model")
         }
         .padding(.vertical, 4)
     }
@@ -562,6 +651,7 @@ struct ModelEditSheet: View {
     @Environment(\.dismiss) private var dismiss
     let model: ModelDefinition
     let isNew: Bool
+    let existingIDs: Set<String>
     let onSave: (ModelDefinition) -> Void
     let onCancel: () -> Void
 
@@ -570,10 +660,12 @@ struct ModelEditSheet: View {
     @State private var supportsVision: Bool
     @State private var supportsReasoning: Bool
     @State private var contextWindowText: String
+    @State private var validationMessage: String?
 
-    init(model: ModelDefinition, isNew: Bool, onSave: @escaping (ModelDefinition) -> Void, onCancel: @escaping () -> Void) {
+    init(model: ModelDefinition, isNew: Bool, existingIDs: Set<String> = [], onSave: @escaping (ModelDefinition) -> Void, onCancel: @escaping () -> Void) {
         self.model = model
         self.isNew = isNew
+        self.existingIDs = existingIDs
         self.onSave = onSave
         self.onCancel = onCancel
         _displayName = State(initialValue: isNew ? "" : model.name)
@@ -601,6 +693,7 @@ struct ModelEditSheet: View {
                     TextField("e.g. 128000", text: $contextWindowText)
                         .keyboardType(.numberPad)
                 }
+                if let validationMessage { Text(validationMessage).font(.caption).foregroundColor(.red) }
             }
             .navigationTitle(isNew ? "Add Model" : "Edit Model")
             .navigationBarTitleDisplayMode(.inline)
@@ -610,16 +703,28 @@ struct ModelEditSheet: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Save") {
-                        let ctxOverride = Int(contextWindowText.trimmingCharacters(in: .whitespaces))
-                        let updated = ModelDefinition(
-                            id: isNew ? UUID().uuidString : model.id,
-                            name: displayName.trimmingCharacters(in: .whitespaces).isEmpty ? modelId : displayName.trimmingCharacters(in: .whitespaces),
-                            supportsVision: supportsVision,
-                            supportsReasoning: supportsReasoning,
-                            contextWindow: ctxOverride ?? model.contextWindow,
-                            contextWindowOverride: ctxOverride
-                        )
-                        onSave(updated)
+                        do {
+                            let id = try ProviderRequestBuilder.validateModelID(modelId)
+                            guard !existingIDs.contains(id) else { throw ProviderServiceError.invalidConfiguration("That model ID already exists in this provider.") }
+                            let contextText = contextWindowText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let ctxOverride = Int(contextText)
+                            if !contextText.isEmpty && (ctxOverride == nil || ctxOverride! <= 0) {
+                                throw ProviderServiceError.invalidConfiguration("Context window must be a positive whole number.")
+                            }
+                            let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let updated = ModelDefinition(
+                                id: id,
+                                name: name.isEmpty ? id : name,
+                                supportsVision: supportsVision,
+                                supportsReasoning: supportsReasoning,
+                                contextWindow: model.contextWindow,
+                                contextWindowOverride: ctxOverride,
+                                sortOrder: model.sortOrder
+                            )
+                            onSave(updated)
+                        } catch {
+                            validationMessage = ProviderServiceError.sanitized(error).localizedDescription
+                        }
                     }
                     .disabled(modelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }

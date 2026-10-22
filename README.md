@@ -22,7 +22,12 @@ PilotAI is a native iOS client for the **PilotAI** mobile autonomous agent and A
   - Persistent user memory markdown editor.
   - Automatic prompt injection across all conversations with estimated token accounting.
 - **Interactive Terminal**:
-  - Sandboxed command shell simulation with command history and monospace console formatting.
+  - Honest iOS-sandboxed console with command history and monospace formatting; arbitrary commands are sent only through an explicitly configured remote gateway.
+- **Shared Browser & Private Workspace**:
+  - Persistent WebKit browser session shared by the UI and agent, with per-action approval, takeover, bounded page observations, and safe HTTP(S)-only navigation.
+  - Revision-protected private workspace with bounded list/read/write/rename operations, secure path handling, and native file import/export.
+- **MCP**:
+  - Streamable HTTP discovery and tool calls with Bearer authentication, modern/legacy protocol negotiation, bounded results, per-tool enablement, and frozen per-run catalogs.
 - **Cross-Platform Backup Compatibility**:
   - Imports and exports `.json` backups fully compatible with PilotAI / Eta Android backups (`format: "eta-backup"`, `schemaVersion: 2`).
 
@@ -46,8 +51,15 @@ PilotAI-iOS/
 │   │   ├── Memory.swift        # Core memory schema
 │   │   └── Settings.swift      # Application preferences
 │   ├── Services/
-│   │   ├── OpenAIService.swift      # AsyncThrowingStream SSE parser
+│   │   ├── OpenAIService.swift      # Provider transport and model discovery
+│   │   ├── ProviderRequestBuilder.swift
+│   │   ├── ProviderStreamParser.swift
 │   │   ├── AgentEngine.swift        # Agent loop and memory injection orchestrator
+│   │   ├── IOSRuntimeToolService.swift
+│   │   ├── IOSMCPService.swift
+│   │   ├── IOSBrowserService.swift
+│   │   ├── WorkspaceService.swift
+│   │   ├── RoleplayContext.swift
 │   │   ├── StorageService.swift     # Local document persistence
 │   │   └── BackupService.swift      # JSON backup import/export
 │   ├── Views/
@@ -57,7 +69,7 @@ PilotAI-iOS/
 │   │   ├── Memory/                  # Markdown memory editor
 │   │   ├── Terminal/                # Console interface
 │   │   ├── Providers/               # Model provider credentials and endpoints
-│   │   └── Settings/                # Appearance, backup, and app info
+│   │   └── Settings/                # Appearance, backup, tools, MCP, and app info
 │   └── Resources/
 │       ├── Info.plist               # Permissions, identifiers, and device configs
 │       ├── LaunchScreen.storyboard  # System launch interface
@@ -74,26 +86,24 @@ PilotAI-iOS/
 
 ## Building
 
-### Option A: Local Packaging on Linux (No macOS Required)
-Run the automated packaging script to compile the Mach-O `arm64` binary and bundle the application archive:
-```bash
-./scripts/package_ipa.sh
-```
-Output archive will be generated at: `build/PilotAI.ipa`.
-
-### Option B: Native macOS & Xcode
+### Option A: Native macOS & Xcode
 1. Open `PilotAI.xcodeproj` in Xcode 15.0 or later on macOS.
 2. Select your development team under **Signing & Capabilities**.
 3. Select an iOS device or simulator, and press **Cmd + R** to run.
 4. To export an archive: **Product &rarr; Archive &rarr; Distribute App &rarr; Ad Hoc or Sideloading**.
 
-### Option C: GitHub Actions Cloud CI
-Push to the repository with the provided `.github/workflows/ios-build.yml`. GitHub Actions runs on `macos-14`, builds the project with `xcodebuild`, packages `PilotAI-unsigned.ipa`, and uploads it as a workflow artifact.
+### Option B: GitHub Actions Cloud CI
+Push to `main`, open **Actions → Build SwiftUI PilotAI iOS IPA**, or start it with **Run workflow**. The macOS runner runs the XCTest target, archives the native SwiftUI `PilotAI` Xcode target, packages the archived `.app` as an unsigned IPA, and uploads `PilotAI-unsigned.ipa` as the `PilotAI-iOS-IPA` artifact.
+
+The Linux script is only a packaging/bootstrap smoke check; it does not compile the SwiftUI sources and must not be used as evidence of an iOS build.
+
+### Option C: GitHub Actions details
+The workflow also runs on pull requests targeting `main`, so source and project-file changes are checked before merge. Signing is disabled in CI; install the artifact only after signing it with your chosen distribution or sideloading workflow.
 
 ---
 
 ## Installation / Sideloading
-The generated `PilotAI.ipa` is ready for sideloading on non-jailbroken and jailbroken iOS devices:
+The GitHub Actions artifact is an **unsigned** `PilotAI-unsigned.ipa`; sign it with your sideloading/distribution tool before installing on a device:
 - **TrollStore** (iOS 14.0 &ndash; 17.0)
 - **AltStore / SideStore**
 - **Scarlet / Sideloadly**

@@ -82,8 +82,8 @@ public struct ChatView: View {
                 InputBarView(
                     text: $inputText,
                     isGenerating: state.isGenerating,
-                    onSend: { webSearch, reasoning in
-                        state.sendMessage(inputText, webSearchEnabled: webSearch, reasoningEnabled: reasoning)
+                    onSend: { attachments, webSearch, reasoning in
+                        state.sendMessage(inputText, attachments: attachments, webSearchEnabled: webSearch, reasoningEnabled: reasoning)
                     },
                     onStop: {
                         state.stopGenerating()
@@ -133,6 +133,14 @@ public struct ChatView: View {
                         }
                         Button(action: { showBrowserSheet = true }) {
                             Label("Open Browser", systemImage: "safari")
+                        }
+                        if let conversation = state.selectedConversation {
+                            Divider()
+                            Button {
+                                state.duplicateConversation(id: conversation.id)
+                            } label: {
+                                Label("Duplicate Conversation", systemImage: "plus.square.on.square")
+                            }
                         }
                     } label: {
                         Image(systemName: "ellipsis.circle")

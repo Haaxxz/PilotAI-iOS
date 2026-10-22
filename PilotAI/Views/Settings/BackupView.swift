@@ -3,134 +3,75 @@ import UniformTypeIdentifiers
 
 public struct BackupView: View {
     @EnvironmentObject private var state: AppState
-    @State private var showExportSheet = false
     @State private var showImportPicker = false
-    @State private var exportItem: ExportItem? = nil
-    @State private var statusMessage: String? = nil
+    @State private var exportItem: ExportItem?
+    @State private var statusMessage: String?
     @State private var isImporting = false
-    
+
     public init() {}
-    
+
     public var body: some View {
         Form {
-            Section(header: Text("Export"), footer: Text("Export all conversations, providers, characters, and memory to a JSON file.")) {
-                Button(action: exportBackup) {
-                    Label("Export Backup", systemImage: "square.and.arrow.up")
-                }
+            Section(header: Text("Export"), footer: Text("Exports Android schema-v2 provider/model rows, conversations, messages, character cards, and MEMORY.md. Skills, MCP servers, and settings use an iOS extension. The shared file includes credentials; store it privately.")) {
+                Button(action: exportBackup) { Label("Export Backup", systemImage: "square.and.arrow.up") }
             }
-            
-            Section(header: Text("Import"), footer: Text("Import a previously exported PilotAI backup. This will merge with existing data.")) {
+            Section(header: Text("Import"), footer: Text("Records with existing IDs are kept while new records are merged. Imported memory and selection preferences can replace current values. Android-only data retained for re-export is not automatically usable in iOS.")) {
                 Button(action: { showImportPicker = true }) {
                     Label(isImporting ? "Importing..." : "Import Backup", systemImage: "square.and.arrow.down")
-                }
-                .disabled(isImporting)
+                }.disabled(isImporting)
             }
-            
-            if let msg = statusMessage {
-                Section {
-                    Text(msg)
-                        .font(.caption)
-                        .foregroundColor(msg.lowercased().contains("success") ? .green : .red)
-                }
-            }
-            
+            if let statusMessage { Section { Text(statusMessage).font(.caption).foregroundColor(statusMessage.contains("success") ? .green : .red) } }
             Section(header: Text("Backup Contents")) {
                 LabeledContent("Conversations", value: "\(state.conversations.count)")
                 LabeledContent("Providers", value: "\(state.providers.count)")
                 LabeledContent("Characters", value: "\(state.characters.count)")
-                LabeledContent("Memory Size", value: "~\(state.memory.markdown.count / 4) tokens")
+                LabeledContent("Skills", value: "\(state.skills.count)")
+                LabeledContent("MCP Servers", value: "\(state.mcpServers.count)")
+                LabeledContent("Memory", value: "~\(state.memory.markdown.estimatedTokenCount) tokens")
             }
         }
-        .navigationTitle("Backup & Restore")
-        .navigationBarTitleDisplayMode(.inline)
-        .sheet(item: $exportItem) { item in
-            BackupShareSheet(items: [item.url])
-        }
-        .fileImporter(
-            isPresented: $showImportPicker,
-            allowedContentTypes: [.json],
-            allowsMultipleSelection: false
-        ) { result in
-            importBackup(result: result)
-        }
+        .navigationTitle("Backup & Restore").navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $exportItem) { BackupShareSheet(items: [$0.url]) }
+        .fileImporter(isPresented: $showImportPicker, allowedContentTypes: [.json], allowsMultipleSelection: false) { importBackup(result: $0) }
     }
-    
+
     private func exportBackup() {
         do {
-            let backup = BackupData(
-                conversations: state.conversations,
-                providers: state.providers,
-                characters: state.characters,
-                memory: state.memory
-            )
-            let data = try JSONEncoder().encode(backup)
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("PilotAI-Backup-\(Date().timeIntervalSince1970).json")
-            try data.write(to: url)
-            exportItem = ExportItem(url: url)
+            let data = try BackupService.shared.exportBackup(providers: state.providers, conversations: state.conversations,
+                memory: state.memory, characters: state.characters,
+                selectedProviderId: state.settings.defaultProviderId, selectedModelId: state.settings.defaultModelId,
+                skills: state.skills, preserving: state.backupPreservation,
+                mcpServers: state.mcpServers, settings: state.settings)
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("PilotAI-backup-\(Int(Date().timeIntervalSince1970)).eta-backup.json")
+            try data.write(to: url, options: [.atomic, .completeFileProtection]); exportItem = ExportItem(url: url)
             statusMessage = "Backup exported successfully."
-        } catch {
-            statusMessage = "Export failed: \(error.localizedDescription)"
-        }
+        } catch { statusMessage = "Export failed: \(error.localizedDescription)" }
     }
-    
+
     private func importBackup(result: Result<[URL], Error>) {
-        isImporting = true
-        statusMessage = nil
+        isImporting = true; defer { isImporting = false }
         do {
             guard let url = try result.get().first else { return }
-            guard url.startAccessingSecurityScopedResource() else {
-                statusMessage = "Cannot access file."
-                isImporting = false
-                return
+            let secure = url.startAccessingSecurityScopedResource(); defer { if secure { url.stopAccessingSecurityScopedResource() } }
+            let payload = try BackupService.shared.importBackup(from: url)
+            let result = state.applyBackup(payload)
+            if let error = StorageService.shared.lastError { statusMessage = "Import changed in-memory data, but persistence failed: \(error.localizedDescription)" }
+            else {
+                statusMessage = "Import successful: +\(result.conversationsAdded) conversations, +\(result.providersAdded) providers, +\(result.charactersAdded) characters, +\(result.skillsAdded) skills."
+                if !payload.importWarnings.isEmpty { statusMessage! += "\n\n" + payload.importWarnings.joined(separator: "\n") }
             }
-            defer { url.stopAccessingSecurityScopedResource() }
-            let data = try Data(contentsOf: url)
-            let backup = try JSONDecoder().decode(BackupData.self, from: data)
-            // Merge
-            let existingConvIds = Set(state.conversations.map { $0.id })
-            let newConvs = backup.conversations.filter { !existingConvIds.contains($0.id) }
-            state.conversations.append(contentsOf: newConvs)
-            
-            let existingProvIds = Set(state.providers.map { $0.id })
-            let newProvs = backup.providers.filter { !existingProvIds.contains($0.id) }
-            state.providers.append(contentsOf: newProvs)
-            
-            let existingCharIds = Set(state.characters.map { $0.id })
-            let newChars = backup.characters.filter { !existingCharIds.contains($0.id) }
-            state.characters.append(contentsOf: newChars)
-            
-            if !backup.memory.markdown.isEmpty && state.memory.markdown.isEmpty {
-                state.memory = backup.memory
-            }
-            
-            state.saveProviders()
-            state.saveCharacters()
-            state.saveMemory(state.memory)
-            
-            statusMessage = "Import successful: +\(newConvs.count) conversations, +\(newProvs.count) providers, +\(newChars.count) characters."
-        } catch {
-            statusMessage = "Import failed: \(error.localizedDescription)"
-        }
-        isImporting = false
+        } catch { statusMessage = "Import failed: \(error.localizedDescription)" }
     }
+
 }
 
-struct ExportItem: Identifiable {
-    let id = UUID()
-    let url: URL
+private extension String {
+    var estimatedTokenCount: Int { max(0, split(whereSeparator: { $0.isWhitespace }).count == 0 ? count / 4 : count / 4) }
 }
 
-struct BackupData: Codable {
-    var conversations: [Conversation]
-    var providers: [ModelProvider]
-    var characters: [Character]
-    var memory: MemoryDocument
-}
-
+struct ExportItem: Identifiable { let id = UUID(); let url: URL }
 struct BackupShareSheet: UIViewControllerRepresentable {
     let items: [Any]
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-    func updateUIViewController(_ uvc: UIActivityViewController, context: Context) {}
+    func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: items, applicationActivities: nil) }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

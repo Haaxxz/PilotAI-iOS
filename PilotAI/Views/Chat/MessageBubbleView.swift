@@ -1,4 +1,6 @@
 import SwiftUI
+import UIKit
+import Foundation
 
 public struct MessageBubbleView: View {
     public let message: Message
@@ -43,9 +45,13 @@ public struct MessageBubbleView: View {
                     ToolExecutionView(toolCalls: tools)
                 }
                 
+                if let attachments = message.attachments, !attachments.isEmpty {
+                    attachmentStrip(attachments)
+                }
+
                 // Main content
                 if !message.content.isEmpty {
-                    Text(message.content)
+                    MessageContentText(content: message.content, rendersMarkdown: message.role == .assistant)
                         .font(.system(size: 15))
                         .foregroundColor(message.role == .user ? .white : .primary)
                         .padding(.horizontal, 14)
@@ -152,5 +158,44 @@ public struct MessageBubbleView: View {
             }
         }
     }
+
+    @ViewBuilder
+    private func attachmentStrip(_ attachments: [MessageAttachment]) -> some View {
+        VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 5) {
+            ForEach(attachments) { attachment in
+                HStack(spacing: 7) {
+                    Image(systemName: attachment.mimeType.hasPrefix("image/") ? "photo.fill" : "doc.fill")
+                        .foregroundColor(message.role == .user ? .white : .blue)
+                    Text(attachment.name)
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+                    if let data = Data(base64Encoded: attachment.dataBase64), attachment.mimeType.hasPrefix("image/"), let image = UIImage(data: data) {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 42, height: 42)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(message.role == .user ? Color.blue.opacity(0.82) : Color(.secondarySystemBackground))
+                .foregroundColor(message.role == .user ? .white : .primary)
+                .cornerRadius(10)
+            }
+        }
+    }
 }
 
+private struct MessageContentText: View {
+    let content: String
+    let rendersMarkdown: Bool
+
+    var body: some View {
+        if rendersMarkdown, let attributed = try? AttributedString(markdown: content) {
+            Text(attributed)
+        } else {
+            Text(content)
+        }
+    }
+}

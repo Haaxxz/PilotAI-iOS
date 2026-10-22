@@ -1,16 +1,35 @@
 import SwiftUI
 import Combine
 
+public struct BackupApplyResult: Equatable {
+    public let conversationsAdded: Int
+    public let providersAdded: Int
+    public let charactersAdded: Int
+    public let skillsAdded: Int
+
+    public init(conversationsAdded: Int, providersAdded: Int, charactersAdded: Int, skillsAdded: Int) {
+        self.conversationsAdded = conversationsAdded
+        self.providersAdded = providersAdded
+        self.charactersAdded = charactersAdded
+        self.skillsAdded = skillsAdded
+    }
+}
+
 @MainActor
 public final class AppState: ObservableObject {
     @Published public var conversations: [Conversation] = []
     @Published public var selectedConversationId: String? = nil
+    /// Main tab contract: Home = 0, Chat = 1, Characters = 2, Settings = 3.
+    @Published public var selectedTab: Int = 0
     @Published public var providers: [ModelProvider] = []
     @Published public var characters: [Character] = []
     @Published public var memory: MemoryDocument = .default
     @Published public var settings: AppSettings = AppSettings()
     @Published public var mcpServers: [McpServer] = []
     @Published public var skills: [Skill] = Skill.defaults
+    /// Imported Android fields that are not represented by the iOS runtime are retained for
+    /// subsequent backup exports and persisted across app launches.
+    @Published public var backupPreservation: PilotAIBackupPayload?
     @Published public var isGenerating: Bool = false
     @Published public var terminalOutput: [String] = [
         "PilotAI Interactive Shell [iOS Environment]",
@@ -29,6 +48,7 @@ public final class AppState: ObservableObject {
         self.settings = storage.loadSettings()
         self.mcpServers = storage.loadMcpServers()
         self.skills = storage.loadSkills()
+        self.backupPreservation = storage.loadBackupPreservation()
         
         if let first = conversations.first {
             self.selectedConversationId = first.id
@@ -95,7 +115,7 @@ public final class AppState: ObservableObject {
     
     // MARK: - Actions
     
-    public func newConversation(mode: ConversationMode = .agent, characterId: String? = nil) {
+    public func newConversation(mode: ConversationMode = .agent, characterId: String? = nil, greeting: String? = nil) {
         let provider = providers.first(where: { $0.id == settings.defaultProviderId && $0.isEnabled })
             ?? providers.first(where: { $0.isEnabled })
             ?? providers.first
@@ -110,8 +130,9 @@ public final class AppState: ObservableObject {
         
         if let charId = characterId, let char = characters.first(where: { $0.id == charId }) {
             title = "\(char.name) Chat"
-            if !char.greeting.isEmpty {
-                initialMessages.append(Message(role: .assistant, content: char.greeting, modelName: model))
+            let openingGreeting = greeting ?? char.greeting
+            if !openingGreeting.isEmpty {
+                initialMessages.append(Message(role: .assistant, content: openingGreeting, modelName: model))
             }
         }
         
@@ -125,6 +146,9 @@ public final class AppState: ObservableObject {
         )
         conversations.insert(newConv, at: 0)
         selectedConversationId = newConv.id
+        // Starting a roleplay from the character library should take the user to the
+        // conversation immediately, matching the Android navigation flow.
+        if characterId != nil { selectedTab = 1 }
         storage.saveConversations(conversations)
     }
     
@@ -133,6 +157,33 @@ public final class AppState: ObservableObject {
         if selectedConversationId == id {
             selectedConversationId = conversations.first?.id
         }
+        storage.saveConversations(conversations)
+    }
+
+    public func renameConversation(id: String, title: String) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        conversations[index].title = String(trimmed.prefix(120))
+        conversations[index].updatedAt = Date()
+        storage.saveConversations(conversations)
+    }
+
+    public func duplicateConversation(id: String) {
+        guard let source = conversations.first(where: { $0.id == id }) else { return }
+        let copiedMessages = source.messages.map { message in
+            Message(role: message.role, content: message.content,
+                    reasoningContent: message.reasoningContent, toolCalls: message.toolCalls,
+                    toolCallId: message.toolCallId,
+                    isStreaming: false, timestamp: message.timestamp, modelName: message.modelName,
+                    attachments: message.attachments)
+        }
+        let copy = Conversation(title: "\(source.title) (Copy)", messages: copiedMessages,
+                                providerId: source.providerId, modelId: source.modelId,
+                                mode: source.mode, characterId: source.characterId)
+        conversations.insert(copy, at: 0)
+        selectedConversationId = copy.id
+        selectedTab = 1
         storage.saveConversations(conversations)
     }
     
@@ -152,14 +203,16 @@ public final class AppState: ObservableObject {
         
         // Find preceding user prompt
         var userPrompt = ""
+        var userAttachments: [MessageAttachment] = []
         for i in (0..<idx).reversed() {
             if conv.messages[i].role == .user {
                 userPrompt = conv.messages[i].content
+                userAttachments = conv.messages[i].attachments ?? []
                 break
             }
         }
         
-        guard !userPrompt.isEmpty else { return }
+        guard !userPrompt.isEmpty || !userAttachments.isEmpty else { return }
         
         // Remove assistant message and any subsequent messages
         conv.messages.removeSubrange(idx..<conv.messages.count)
@@ -169,8 +222,8 @@ public final class AppState: ObservableObject {
             storage.saveConversations(conversations)
         }
         
-        // Re-send prompt
-        sendMessage(userPrompt)
+        // Re-send prompt with the original attachment payloads.
+        sendMessage(userPrompt, attachments: userAttachments)
     }
     
     @discardableResult
@@ -191,19 +244,20 @@ public final class AppState: ObservableObject {
         return userText
     }
     
-    public func sendMessage(_ text: String, webSearchEnabled: Bool = false, reasoningEnabled: Bool = false) {
-        guard let conv = selectedConversation, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    public func sendMessage(_ text: String, attachments: [MessageAttachment] = [], webSearchEnabled: Bool = false, reasoningEnabled: Bool = false) {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let conv = selectedConversation, !trimmedText.isEmpty || !attachments.isEmpty else { return }
         guard let prov = currentProvider else { return }
         
-        let userMsg = Message(role: .user, content: text)
+        let userMsg = Message(role: .user, content: text, attachments: attachments.isEmpty ? nil : attachments)
         var updatedMessages = conv.messages
         updatedMessages.append(userMsg)
         
         // Auto update title on first message
         var title = conv.title
         if conv.messages.filter({ $0.role == .user }).isEmpty {
-            title = String(text.prefix(28)).trimmingCharacters(in: .whitespacesAndNewlines)
-            if title.isEmpty { title = "Conversation" }
+            title = String(trimmedText.prefix(28))
+            if title.isEmpty { title = attachments.first?.name ?? "Attachment" }
         }
         
         var updatedConv = conv
@@ -222,17 +276,30 @@ public final class AppState: ObservableObject {
             memory: memory,
             webSearchEnabled: webSearchEnabled,
             reasoningEnabled: reasoningEnabled,
-            onUpdate: { [weak self] streamingMsg in
-                guard let self = self else { return }
-                var currentList = self.selectedConversation?.messages ?? []
-                if let last = currentList.last, last.role == .assistant && last.isStreaming {
-                    currentList[currentList.count - 1] = streamingMsg
-                } else {
-                    currentList.append(streamingMsg)
-                }
-                self.selectedConversation?.messages = currentList
+            settings: settings,
+            skills: skills,
+            conversations: conversations,
+            mcpServers: mcpServers,
+            onMemoryUpdate: { [weak self] updated in
+                self?.memory = updated
             },
-            onCompletion: { [weak self] result in
+            onMCPUpdate: { [weak self] refreshed in
+                guard let self else { return }
+                for server in refreshed { self.updateMcpServer(server) }
+            },
+            onUpdate: { [weak self] streamingMsg in
+                guard let self = self,
+                      let index = self.conversations.firstIndex(where: { $0.id == updatedConv.id }) else { return }
+                var origin = self.conversations[index]
+                if let last = origin.messages.last, last.role == .assistant && last.isStreaming {
+                    origin.messages[origin.messages.count - 1] = streamingMsg
+                } else {
+                    origin.messages.append(streamingMsg)
+                }
+                origin.updatedAt = Date()
+                self.conversations[index] = origin
+            },
+            onCompletion: { [weak self] _ in
                 guard let self = self else { return }
                 self.isGenerating = false
                 self.storage.saveConversations(self.conversations)
@@ -260,19 +327,11 @@ public final class AppState: ObservableObject {
             return
         }
         
-        if settings.enableUnsandboxedGateway, let url = URL(string: settings.remoteGatewayURL.trimmingCharacters(in: .whitespacesAndNewlines)), !settings.remoteGatewayURL.isEmpty {
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let body: [String: String] = ["command": cmd]
-            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-            
+        if settings.enableTerminalTool && settings.enableUnsandboxedGateway {
             Task { @MainActor in
                 do {
-                    let (data, _) = try await URLSession.shared.data(for: req)
-                    if let str = String(data: data, encoding: .utf8) {
-                        self.terminalOutput.append(str)
-                    }
+                    let output = try await IOSRuntimeToolService.executeGatewayCommand(cmd, settings: self.settings)
+                    self.terminalOutput.append(output)
                 } catch {
                     self.terminalOutput.append("Gateway Connection Error: \(error.localizedDescription)")
                 }
@@ -300,7 +359,7 @@ public final class AppState: ObservableObject {
         case "date":
             terminalOutput.append(Date().description)
         default:
-            terminalOutput.append("pilot: command executed: '\(cmd)'")
+            terminalOutput.append("pilot: local iOS shell access is unavailable; '\(cmd)' was not executed. Enable the explicit Remote Gateway to run it on a user-controlled machine.")
         }
         terminalOutput.append("")
     }
@@ -320,6 +379,64 @@ public final class AppState: ObservableObject {
     
     public func saveCharacters() {
         storage.saveCharacters(characters)
+    }
+
+    public func applyBackup(_ payload: PilotAIBackupPayload) -> BackupApplyResult {
+        let conversationsAdded = mergeByID(payload.conversations ?? [], into: &conversations)
+        let providersAdded = mergeByID(payload.providers ?? [], into: &providers)
+        let charactersAdded = mergeByID(payload.characters ?? [], into: &characters)
+        let skillsAdded = mergeByID(payload.skills ?? [], into: &skills)
+
+        if let importedMemory = payload.memory {
+            memory = importedMemory
+        } else if let markdown = payload.memoryMd, !markdown.isEmpty {
+            memory.markdown = markdown
+            memory.lastModified = Date()
+        }
+
+        if let importedSettings = payload.settings {
+            settings = importedSettings
+        }
+
+        if let importedServers = payload.mcpServers {
+            _ = mergeByID(importedServers, into: &mcpServers)
+        }
+
+        if let providerID = payload.selectedProviderId,
+           let provider = providers.first(where: { $0.id == providerID }) {
+            settings.defaultProviderId = provider.id
+            if let modelID = payload.selectedModelId,
+               provider.models.isEmpty || provider.models.contains(where: { $0.id == modelID }) {
+                settings.defaultModelId = modelID
+            } else if !provider.defaultModelId.isEmpty {
+                settings.defaultModelId = provider.defaultModelId
+            }
+        }
+
+        backupPreservation = payload
+        storage.saveConversations(conversations)
+        storage.saveProviders(providers)
+        storage.saveCharacters(characters)
+        storage.saveSkills(skills)
+        storage.saveMcpServers(mcpServers)
+        storage.saveMemory(memory)
+        storage.saveSettings(settings)
+        storage.saveBackupPreservation(payload)
+
+        return BackupApplyResult(conversationsAdded: conversationsAdded, providersAdded: providersAdded,
+                                 charactersAdded: charactersAdded, skillsAdded: skillsAdded)
+    }
+
+    public func clearBackupPreservation() {
+        backupPreservation = nil
+        storage.saveBackupPreservation(nil)
+    }
+
+    private func mergeByID<T: Identifiable>(_ incoming: [T], into target: inout [T]) -> Int where T.ID == String {
+        let existingIDs = Set(target.map(\.id))
+        let additions = incoming.filter { !existingIDs.contains($0.id) }
+        target.append(contentsOf: additions)
+        return additions.count
     }
     
     public func addProvider(_ provider: ModelProvider) {
