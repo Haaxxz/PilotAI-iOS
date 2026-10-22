@@ -100,12 +100,30 @@ public final class IOSBrowserService: NSObject, ObservableObject, WKNavigationDe
         webView.navigationDelegate = self
         webView.uiDelegate = self
         observations = [
-            webView.observe(\.url, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.title, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.isLoading, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.syncState() } }
+            webView.observe(\.url, options: [.new]) { [weak self] _, _ in
+                guard let self else { return }
+                Task { @MainActor in self.syncState() }
+            },
+            webView.observe(\.title, options: [.new]) { [weak self] _, _ in
+                guard let self else { return }
+                Task { @MainActor in self.syncState() }
+            },
+            webView.observe(\.isLoading, options: [.new]) { [weak self] _, _ in
+                guard let self else { return }
+                Task { @MainActor in self.syncState() }
+            },
+            webView.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in
+                guard let self else { return }
+                Task { @MainActor in self.syncState() }
+            },
+            webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in
+                guard let self else { return }
+                Task { @MainActor in self.syncState() }
+            },
+            webView.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in
+                guard let self else { return }
+                Task { @MainActor in self.syncState() }
+            }
         ]
         syncState()
     }
@@ -199,7 +217,8 @@ public final class IOSBrowserService: NSObject, ObservableObject, WKNavigationDe
                 }
             }
         }, onCancel: { [weak self] in
-            Task { @MainActor in if self?.pendingApproval?.id == request.id { self?.resolveApproval(accepted: false) } }
+            guard let self else { return }
+            Task { @MainActor in if self.pendingApproval?.id == request.id { self.resolveApproval(accepted: false) } }
         })
         try Task.checkCancellation()
         guard accepted, visibleViews > 0, UIApplication.shared.applicationState == .active, !isTakenOver, !isResetting else {
@@ -366,16 +385,20 @@ public final class IOSBrowserService: NSObject, ObservableObject, WKNavigationDe
                 // Fixed app-owned scripts, parameterized values, isolated namespace, main frame.
                 // Neither the model nor page content can supply executable JavaScript.
                 webView.callAsyncJavaScript(script, arguments: arguments, in: nil, in: .defaultClient) { [weak self] result in
+                    guard let self else { return }
                     Task { @MainActor in
                         let parsed = result.flatMap { value -> Result<[String: Any], Error> in
                             guard let object = value as? [String: Any] else { return .failure(BrowserError.unavailable("Invalid WebKit result.")) }
                             return .success(object)
                         }
-                        self?.finishEvaluation(id, result: parsed)
+                        self.finishEvaluation(id, result: parsed)
                     }
                 }
             }
-        }, onCancel: { [weak self] in Task { @MainActor in self?.finishEvaluation(id, result: .failure(CancellationError())) } })
+        }, onCancel: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in self.finishEvaluation(id, result: .failure(CancellationError())) }
+        })
     }
 
     private func finishEvaluation(_ id: UUID, result: Result<[String: Any], Error>) {
